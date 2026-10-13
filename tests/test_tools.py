@@ -1,5 +1,6 @@
 """Unit tests for the weather tools. Network calls are stubbed; no API keys needed."""
 
+import httpx
 import pytest
 
 from weather_agent import tools
@@ -276,3 +277,57 @@ def test_get_forecast_rejects_out_of_range_days(days):
 
     assert result["status"] == "error"
     assert "1 to 16" in result["error_message"]
+
+
+def use_mock_transport(monkeypatch, handler):
+    monkeypatch.setattr(tools, "_http_client", httpx.Client(transport=httpx.MockTransport(handler)))
+
+
+def test_get_json_retries_once_after_timeout(monkeypatch):
+    attempts = []
+
+    def handler(request):
+        attempts.append(request)
+        if len(attempts) == 1:
+            raise httpx.ReadTimeout("stalled", request=request)
+        return httpx.Response(200, json={"ok": True})
+
+    use_mock_transport(monkeypatch, handler)
+
+    assert tools._get_json(tools.FORECAST_URL, {}) == {"ok": True}
+    assert len(attempts) == 2
+
+
+def test_get_json_gives_up_after_two_timeouts(monkeypatch):
+    attempts = []
+
+    def handler(request):
+        attempts.append(request)
+        raise httpx.ReadTimeout("stalled", request=request)
+
+    use_mock_transport(monkeypatch, handler)
+
+    with pytest.raises(tools.WeatherLookupError, match="timed out"):
+        tools._get_json(tools.FORECAST_URL, {})
+    assert len(attempts) == tools.REQUEST_ATTEMPTS
+
+
+def test_get_json_does_not_retry_http_errors(monkeypatch):
+    attempts = []
+
+    def handler(request):
+        attempts.append(request)
+        return httpx.Response(429)
+
+    use_mock_transport(monkeypatch, handler)
+
+    with pytest.raises(tools.WeatherLookupError, match="HTTP 429"):
+        tools._get_json(tools.FORECAST_URL, {})
+    assert len(attempts) == 1
+
+
+def test_get_json_invalid_json(monkeypatch):
+    use_mock_transport(monkeypatch, lambda request: httpx.Response(200, text="not json"))
+
+    with pytest.raises(tools.WeatherLookupError, match="invalid JSON"):
+        tools._get_json(tools.FORECAST_URL, {})

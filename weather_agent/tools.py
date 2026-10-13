@@ -15,7 +15,10 @@ logger = logging.getLogger(__name__)
 
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-REQUEST_TIMEOUT_SECONDS = 10.0
+# Short timeouts plus one retry: a stalled request is retried quickly instead of
+# leaving the agent waiting on a single slow connection.
+REQUEST_TIMEOUT = httpx.Timeout(4.0, connect=2.0)
+REQUEST_ATTEMPTS = 2
 MAX_FORECAST_DAYS = 16  # Open-Meteo's forecast horizon
 GEOCODE_CANDIDATES = 10
 MAX_OTHER_MATCHES = 3
@@ -24,7 +27,7 @@ COUNTRY_ALIASES = {"usa": "us", "u.s.": "us", "u.s.a.": "us", "uk": "gb"}
 
 # One pooled client so repeat calls reuse the TLS connection instead of
 # paying a fresh handshake on every request.
-_http_client = httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)
+_http_client = httpx.Client(timeout=REQUEST_TIMEOUT)
 
 # WMO weather interpretation codes used by Open-Meteo.
 WMO_WEATHER_CODES = {
@@ -79,19 +82,29 @@ def weekday_name(iso_date_or_datetime: str) -> str:
 
 
 def _get_json(url: str, params: dict) -> dict:
-    """Performs a GET request and returns the decoded JSON body."""
-    try:
-        response = _http_client.get(url, params=params)
-        response.raise_for_status()
-        return response.json()
-    except httpx.TimeoutException as exc:
-        raise WeatherLookupError("The weather service timed out.") from exc
-    except httpx.HTTPStatusError as exc:
-        raise WeatherLookupError(
-            f"The weather service returned HTTP {exc.response.status_code}."
-        ) from exc
-    except (httpx.HTTPError, ValueError) as exc:
-        raise WeatherLookupError(f"The weather service request failed: {exc}") from exc
+    """Performs a GET request and returns the decoded JSON body.
+
+    Timeouts and connection failures are retried once; HTTP error statuses are not.
+    """
+    for attempt in range(1, REQUEST_ATTEMPTS + 1):
+        try:
+            response = _http_client.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            if attempt < REQUEST_ATTEMPTS:
+                logger.info("Retrying %s after %s (attempt %d)", url, type(exc).__name__, attempt)
+                continue
+            if isinstance(exc, httpx.TimeoutException):
+                raise WeatherLookupError("The weather service timed out.") from exc
+            raise WeatherLookupError(f"Could not reach the weather service: {exc}") from exc
+        except httpx.HTTPStatusError as exc:
+            raise WeatherLookupError(
+                f"The weather service returned HTTP {exc.response.status_code}."
+            ) from exc
+        except ValueError as exc:
+            raise WeatherLookupError(f"The weather service sent invalid JSON: {exc}") from exc
+    raise AssertionError("unreachable")
 
 
 @functools.lru_cache(maxsize=256)
