@@ -35,12 +35,19 @@ NO_REPLY_MESSAGE = "Sorry, I didn't get a response. Please try again."
 MODEL_CHOICES = list(dict.fromkeys([MODEL, DEFAULT_MODEL, CLAUDE_MODEL]))
 WARMUP_ENABLED = os.getenv("WEATHER_AGENT_WARMUP", "1") != "0"
 WARMUP_CITY = "London"
+CLAUDE_SETUP_MESSAGE = (
+    "Claude setup: Claude needs an Anthropic API key. Add ANTHROPIC_API_KEY=sk-ant-... to "
+    "weather_agent/.env and restart the app. Without a key, the app tries Claude in "
+    "Agent Platform, which must be enabled for your Google Cloud project. "
+    "Gemini works without any of this."
+)
 
 logger = logging.getLogger(__name__)
 
 _runners: dict[str, InMemoryRunner] = {}  # model name -> runner
 _session_ids: dict[tuple[str, str], str] = {}  # (browser session, model) -> ADK session
 _warmed_models: set[str] = set()
+_last_selected_model: dict[str, str] = {}  # browser session -> model last selected
 
 
 def _get_runner(model_name: str) -> InMemoryRunner:
@@ -95,6 +102,24 @@ async def warm_up_model(model_name: str) -> None:
     except Exception as exc:  # a failed warm-up must never block the UI
         _warmed_models.discard(model_name)
         logger.warning("Model warm-up (%s) failed: %s: %s", model_name, type(exc).__name__, exc)
+
+
+async def on_model_selected(model_name: str, request: gr.Request) -> None:
+    """Shows Claude setup instructions when needed, then warms up the chosen model.
+
+    The dropdown can fire more than once per selection (select + blur), so the
+    notice is shown only when the model actually changes for this browser tab.
+    """
+    model_name = (model_name or "").strip()
+    tab = (request.session_hash if request else None) or "local"
+    is_new_selection = _last_selected_model.get(tab) != model_name
+    _last_selected_model[tab] = model_name
+    if is_new_selection and model_name.startswith("claude-"):
+        if os.getenv("ANTHROPIC_API_KEY"):
+            gr.Info(f"{model_name} via the Anthropic API.", title="Using Claude", duration=4)
+        else:
+            gr.Warning(CLAUDE_SETUP_MESSAGE, title="Claude setup", duration=None)
+    await warm_up_model(model_name)
 
 
 async def respond(message: str, history: list, model_name: str, request: gr.Request):
@@ -153,8 +178,8 @@ with gr.Blocks(title="Weather Agent") as demo:
             ["Compare Miami and Seattle right now."],
         ],
     )
-    demo.load(warm_up_model, inputs=model_choice)
-    model_choice.change(warm_up_model, inputs=model_choice)
+    demo.load(on_model_selected, inputs=model_choice)
+    model_choice.input(on_model_selected, inputs=model_choice)
 
 if WARMUP_ENABLED:
     threading.Thread(target=_warm_weather_api, name="weather-warmup", daemon=True).start()
