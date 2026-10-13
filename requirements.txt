@@ -1,3 +1,4 @@
 # Pinned to the course environment's ADK version.
 google-adk==2.7.0
 httpx
+gradio>=5

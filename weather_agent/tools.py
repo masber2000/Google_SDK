@@ -5,6 +5,8 @@ credentials. Each tool returns a dict with a "status" key: "success" with
 the data, or "error" with an "error_message" the model can relay to the user.
 """
 
+import datetime
+import functools
 import logging
 
 import httpx
@@ -15,6 +17,14 @@ GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 REQUEST_TIMEOUT_SECONDS = 10.0
 MAX_FORECAST_DAYS = 16  # Open-Meteo's forecast horizon
+GEOCODE_CANDIDATES = 10
+MAX_OTHER_MATCHES = 3
+AMBIGUITY_POPULATION_RATIO = 0.25  # alternative must be >= 25% of the top match
+COUNTRY_ALIASES = {"usa": "us", "u.s.": "us", "u.s.a.": "us", "uk": "gb"}
+
+# One pooled client so repeat calls reuse the TLS connection instead of
+# paying a fresh handshake on every request.
+_http_client = httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)
 
 # WMO weather interpretation codes used by Open-Meteo.
 WMO_WEATHER_CODES = {
@@ -63,10 +73,15 @@ def celsius_to_fahrenheit(celsius: float) -> float:
     return round(celsius * 9 / 5 + 32, 1)
 
 
+def weekday_name(iso_date_or_datetime: str) -> str:
+    """Returns the weekday for an ISO date or datetime string, e.g. 'Tuesday'."""
+    return datetime.date.fromisoformat(iso_date_or_datetime[:10]).strftime("%A")
+
+
 def _get_json(url: str, params: dict) -> dict:
     """Performs a GET request and returns the decoded JSON body."""
     try:
-        response = httpx.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+        response = _http_client.get(url, params=params)
         response.raise_for_status()
         return response.json()
     except httpx.TimeoutException as exc:
@@ -79,21 +94,63 @@ def _get_json(url: str, params: dict) -> dict:
         raise WeatherLookupError(f"The weather service request failed: {exc}") from exc
 
 
-def _geocode(city: str) -> dict:
-    """Resolves a city name to its best-matching location record."""
+@functools.lru_cache(maxsize=256)
+def _geocode_candidates(name: str) -> tuple:
+    """Returns geocoding candidates for a place name, most prominent first.
+
+    Cached because city coordinates never change; failures raise and are
+    therefore not cached.
+    """
     data = _get_json(
-        GEOCODING_URL, {"name": city, "count": 1, "language": "en", "format": "json"}
+        GEOCODING_URL,
+        {"name": name, "count": GEOCODE_CANDIDATES, "language": "en", "format": "json"},
     )
-    results = data.get("results") or []
-    if not results:
-        raise WeatherLookupError(f"Could not find a location named '{city}'.")
-    return results[0]
+    return tuple(data.get("results") or [])
+
+
+def _matches_qualifier(place: dict, qualifier: str) -> bool:
+    """True if a qualifier like 'Illinois', 'France' or 'US' fits the place."""
+    wanted = qualifier.casefold()
+    wanted = COUNTRY_ALIASES.get(wanted, wanted)
+    fields = (place.get("admin1"), place.get("country"), place.get("country_code"))
+    return any(field and field.casefold().startswith(wanted) for field in fields)
 
 
 def _location_label(place: dict) -> str:
     """Builds a readable label like 'Paris, Ile-de-France, France'."""
     parts = [place.get("name"), place.get("admin1"), place.get("country")]
     return ", ".join(part for part in parts if part)
+
+
+def resolve_location(city: str) -> tuple[dict, list[str]]:
+    """Resolves 'City' or 'City, Region/Country' to a place plus other candidates.
+
+    Returns the best match and labels of other same-named places, so the
+    agent can tell the user when a name like 'Springfield' is ambiguous.
+    """
+    name, *qualifiers = [part.strip() for part in city.split(",") if part.strip()] or [""]
+    if not name:
+        raise WeatherLookupError("A city name is required.")
+
+    candidates = _geocode_candidates(name.casefold())
+    same_name = [p for p in candidates if p.get("name", "").casefold() == name.casefold()]
+    pool = same_name or list(candidates)
+    matches = [p for p in pool if all(_matches_qualifier(p, q) for q in qualifiers)]
+    if not matches:
+        raise WeatherLookupError(f"Could not find a location named '{city}'.")
+
+    best = matches[0]
+    best_population = best.get("population") or 0
+    # Only flag genuinely comparable places: Springfield, IL vs MO is ambiguous,
+    # London, Ontario vs London, England is not worth interrupting the user for.
+    comparable = [
+        p
+        for p in matches[1:]
+        if not best_population
+        or (p.get("population") or 0) >= best_population * AMBIGUITY_POPULATION_RATIO
+    ]
+    others = [_location_label(p) for p in comparable[:MAX_OTHER_MATCHES]]
+    return best, others
 
 
 def _error(message: str) -> dict:
@@ -104,13 +161,14 @@ def get_weather(city: str) -> dict:
     """Retrieves the current weather for a city.
 
     Args:
-        city: The city name, for example "Paris" or "Tokyo". When several
-            places share a name, the most prominent match is used and the
-            resolved location is returned so it can be confirmed.
+        city: The city name, optionally followed by a region or country to
+            disambiguate, for example "Paris", "Paris, Texas" or
+            "Springfield, Illinois".
 
     Returns:
-        dict: On success, status "success" with the resolved location, local
-        observation time, conditions, temperature in Celsius and Fahrenheit,
+        dict: On success, status "success" with the resolved location, any
+        other_matches (other places with the same name), local observation
+        time and weekday, conditions, temperature in Celsius and Fahrenheit,
         feels-like temperature, relative humidity, and wind speed. On failure,
         status "error" with an error_message.
     """
@@ -118,7 +176,7 @@ def get_weather(city: str) -> dict:
         return _error("A city name is required.")
 
     try:
-        place = _geocode(city.strip())
+        place, other_matches = resolve_location(city)
         data = _get_json(
             FORECAST_URL,
             {
@@ -137,7 +195,9 @@ def get_weather(city: str) -> dict:
         return {
             "status": "success",
             "location": _location_label(place),
+            "other_matches": other_matches,
             "observed_at_local": current["time"],
+            "local_weekday": weekday_name(current["time"]),
             "timezone": data.get("timezone", "unknown"),
             "conditions": describe_weather_code(current["weather_code"]),
             "temperature_c": temperature_c,
@@ -150,7 +210,7 @@ def get_weather(city: str) -> dict:
     except WeatherLookupError as exc:
         logger.warning("get_weather failed for %r: %s", city, exc)
         return _error(str(exc))
-    except (KeyError, TypeError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         logger.error("Unexpected Open-Meteo response shape for %r: %r", city, exc)
         return _error("The weather service returned data in an unexpected format.")
 
@@ -158,13 +218,19 @@ def get_weather(city: str) -> dict:
 def get_forecast(city: str, days: int = 3) -> dict:
     """Retrieves a daily weather forecast for a city.
 
+    The first entry is today in the city's local time zone; each entry has a
+    weekday so relative requests ("tomorrow", "this weekend") can be matched.
+
     Args:
-        city: The city name, for example "Paris" or "Tokyo".
+        city: The city name, optionally followed by a region or country to
+            disambiguate, for example "Paris, Texas".
         days: Number of forecast days to return, from 1 to 16. Defaults to 3.
+            Use 7 to cover any day in the coming week, including the weekend.
 
     Returns:
-        dict: On success, status "success" with the resolved location and a
-        list of daily entries (date, conditions, high and low in Celsius and
+        dict: On success, status "success" with the resolved location, any
+        other_matches, today's local date and weekday, and a list of daily
+        entries (date, weekday, conditions, high and low in Celsius and
         Fahrenheit, maximum precipitation probability). On failure, status
         "error" with an error_message.
     """
@@ -174,7 +240,7 @@ def get_forecast(city: str, days: int = 3) -> dict:
         return _error(f"days must be a whole number from 1 to {MAX_FORECAST_DAYS}.")
 
     try:
-        place = _geocode(city.strip())
+        place, other_matches = resolve_location(city)
         data = _get_json(
             FORECAST_URL,
             {
@@ -196,14 +262,15 @@ def get_forecast(city: str, days: int = 3) -> dict:
             daily["temperature_2m_min"],
             daily["precipitation_probability_max"],
         )
-        if any(len(values) != len(dates) for values in series):
-            raise KeyError("daily arrays have mismatched lengths")
+        if not dates or any(len(values) != len(dates) for values in series):
+            raise KeyError("daily arrays are empty or have mismatched lengths")
 
         forecast = []
         for date, code, high_c, low_c, precip_pct in zip(dates, *series):
             forecast.append(
                 {
                     "date": date,
+                    "weekday": weekday_name(date),
                     "conditions": describe_weather_code(code),
                     "high_c": high_c,
                     "high_f": celsius_to_fahrenheit(high_c),
@@ -215,12 +282,15 @@ def get_forecast(city: str, days: int = 3) -> dict:
         return {
             "status": "success",
             "location": _location_label(place),
+            "other_matches": other_matches,
+            "today_local": dates[0],
+            "today_weekday": weekday_name(dates[0]),
             "timezone": data.get("timezone", "unknown"),
             "forecast": forecast,
         }
     except WeatherLookupError as exc:
         logger.warning("get_forecast failed for %r: %s", city, exc)
         return _error(str(exc))
-    except (KeyError, TypeError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         logger.error("Unexpected Open-Meteo response shape for %r: %r", city, exc)
         return _error("The weather service returned data in an unexpected format.")
