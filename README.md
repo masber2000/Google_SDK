@@ -4,7 +4,7 @@ A single-agent weather bot built with the [Agent Development Kit](https://adk.de
 
 ## How it works
 
-`weather_agent/agent.py` defines `root_agent`, an ADK `Agent` running Gemini (`gemini-2.5-flash` by default; override with `WEATHER_AGENT_MODEL`) with two function tools from `weather_agent/tools.py`:
+`weather_agent/agent.py` defines `root_agent`, an ADK `Agent` running Gemini (`gemini-2.5-flash` by default) or Claude (see *Using Claude*) with two function tools from `weather_agent/tools.py`:
 
 | Tool | What it does |
 |------|--------------|
@@ -43,7 +43,16 @@ from app import demo
 demo.launch(debug=True)
 ```
 
-The GUI keeps the agent loaded between questions and shows a status line while a tool is running.
+The GUI keeps the agent loaded between questions, shows a status line while a tool is running, and has a **Model** picker (Gemini or Claude; you can also type any model name). When the page opens it warms up the weather API connections and makes one tiny model call, so the first real question doesn't pay start-up costs. Set `WEATHER_AGENT_WARMUP=0` to skip that.
+
+### Using Claude
+
+Pick `claude-opus-5-5` in the GUI, or set `WEATHER_AGENT_MODEL=claude-opus-5-5` for `adk run` / `adk web`. The backend is chosen automatically:
+
+- `ANTHROPIC_API_KEY` set -> the Anthropic API directly.
+- Not set -> Claude in Agent Platform, using `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_LOCATION` (Claude must be enabled in Model Garden for that project).
+
+Claude runs at `low` effort by default (`WEATHER_AGENT_CLAUDE_EFFORT` to change), since weather lookups are simple tool routing.
 
 ### ADK CLI and dev UI
 

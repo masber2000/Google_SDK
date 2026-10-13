@@ -1,4 +1,7 @@
 # Pinned to the course environment's ADK version.
 google-adk==2.7.0
 httpx
-gradio>=5
+# Gradio 5 can't be installed alongside google-adk 2.7.0 (starlette/websockets pins).
+gradio>=6
+# Only needed for Claude models (ADK's own minimum).
+anthropic>=0.78
