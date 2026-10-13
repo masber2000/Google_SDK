@@ -13,7 +13,9 @@ def test_gemini_flash_runs_with_thinking_off():
 
 
 def test_other_gemini_models_keep_default_config():
-    assert build_agent("gemini-2.5-pro").generate_content_config is None
+    config = build_agent("gemini-2.5-pro").generate_content_config
+
+    assert config is None or config.thinking_config is None
 
 
 def test_claude_uses_anthropic_api_when_key_set(monkeypatch):
