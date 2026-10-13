@@ -4,7 +4,7 @@ A single-agent weather bot built with the [Agent Development Kit](https://adk.de
 
 ## How it works
 
-`weather_agent/agent.py` defines `root_agent`, an ADK `Agent` running Gemini (`gemini-flash-latest` by default) with two function tools from `weather_agent/tools.py`:
+`weather_agent/agent.py` defines `root_agent`, an ADK `Agent` running Gemini (`gemini-2.5-flash` by default; override with `WEATHER_AGENT_MODEL`) with two function tools from `weather_agent/tools.py`:
 
 | Tool | What it does |
 |------|--------------|

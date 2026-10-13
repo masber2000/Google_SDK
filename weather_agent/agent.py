@@ -6,7 +6,7 @@ from google.adk.agents import Agent
 
 from .tools import get_forecast, get_weather
 
-MODEL = os.getenv("WEATHER_AGENT_MODEL", "gemini-flash-latest")
+MODEL = os.getenv("WEATHER_AGENT_MODEL", "gemini-2.5-flash")
 
 root_agent = Agent(
     name="weather_agent",
