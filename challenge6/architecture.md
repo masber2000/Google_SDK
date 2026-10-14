@@ -1,6 +1,6 @@
 # ReadyNow! architecture
 
-How a message flows: the root's input callbacks log it, screen it (local patterns + Model Armor) and check it is on-mission; the root agent then calls specialists as tools and writes one answer. Every agent logs each step as a JSON line, which Agent Platform sends to Cloud Logging.
+How a message flows: the root's input callbacks log it, screen it (local patterns + Model Armor) and check it is on-mission; the root agent then calls specialists as tools and writes one answer. Every agent logs each step as a JSON line, which Agent Platform sends to Cloud Logging. Google Maps (Places API (New) for geocoding and safe places, Routes API for directions) is called with Google Cloud OAuth, or with an API key when one is configured.
 
 ```mermaid
 flowchart LR
@@ -30,10 +30,10 @@ flowchart LR
     subgraph EXT["Google Cloud and external services"]
         direction TB
         NWS[("NWS API<br/>alerts · forecasts")]
-        MAPS[("Google Maps<br/>Geocoding · Places · Routes")]
+        MAPS[("Google Maps Platform<br/>Places (New) · Routes<br/>OAuth sign-in or API key")]
         GS[("Google Search")]
         MA[("Model Armor<br/>AgentAI_Course")]
-        SM[("Secret Manager<br/>Maps API key")]
+        SM[("Secret Manager<br/>Maps API key, if used")]
         CL[("Cloud Logging<br/>JSON interaction log")]
     end
 
@@ -43,7 +43,7 @@ flowchart LR
     R -->|answer| U
     W --> NWS
     W & RT --> MAPS
-    RT -.->|reads key| SM
+    RT -.->|optional key| SM
     N & D --> GS
     S --> MA
     AP -.->|stdout| CL
